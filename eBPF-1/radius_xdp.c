@@ -39,6 +39,7 @@ static long (*bpf_map_update_elem)(const void *map, const void *key, const void 
 #define MAC_STR_LEN                      17    /* "aa:bb:cc:dd:ee:ff" */
 #define VLAN_STR_MAX                     4     /* fino a 4 cifre */
 #define VLAN_ID_MAX                      4094  /* range VLAN valido */
+#define RADIUS_MAX_PACKET                4096  /* lunghezza massima RADIUS (RFC 2865) */
 
 /* chiave della mappa: MAC del client */
 struct mac_key {
@@ -200,6 +201,11 @@ int parse_radius(struct xdp_md *ctx)
     __u16 rad_len = (__u16)(((__u16)radius->length_hi << 8) | radius->length_lo);
     if (rad_len < RADIUS_HDR_LEN)
         return XDP_PASS;
+    /* cap esplicito (RFC 2865): oltre a scartare pacchetti patologici, dà al
+     * verifier un umax noto sul registro — su alcuni kernel l'OR di due load
+     * perde il bound superiore e blocca l'aritmetica "puntatore + scalare" */
+    if (rad_len > RADIUS_MAX_PACKET)
+        return XDP_PASS;
 
     /* limite degli attributi, clamped al pacchetto reale (padding/troncamento) */
     void *rad_end = (char *)radius + rad_len;
@@ -216,17 +222,21 @@ int parse_radius(struct xdp_md *ctx)
     /* gli attributi partono subito dopo i 20 byte di header */
     __u8 *attr = (void *)(radius + 1);
 
-    /* cammino sui TLV: 2 byte (type, length) + valore */
+    /* cammino sui TLV: 2 byte (type, length) + valore.
+     * Ogni accesso è verificato SIA contro rad_end (semantica: padding/troncamento)
+     * SIA contro data_end: il verifier estende il range leggibile del puntatore
+     * solo sui confronti con data_end, essendo rad_end a sua volta derivato da
+     * un puntatore a offset variabile (radius + rad_len) */
 #pragma unroll 32
     for (int i = 0; i < RADIUS_MAX_ATTRS; i++) {
-        if ((void *)(attr + 2) > rad_end)
+        if ((void *)(attr + 2) > rad_end || (void *)(attr + 2) > data_end)
             break;
         __u8 type = attr[0];
         __u8 alen = attr[1];
         /* TLV malformato: mi fermo */
         if (alen < 2)
             break;
-        if ((void *)(attr + alen) > rad_end)
+        if ((void *)(attr + alen) > rad_end || (void *)(attr + alen) > data_end)
             break;
         __u8 *val = attr + 2;
         __u8 vlen = alen - 2;
