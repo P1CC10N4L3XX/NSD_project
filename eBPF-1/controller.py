@@ -11,6 +11,9 @@ import time
 STATUS_ALLOWED = 1
 VLAN_MAX = 4094
 FDB_RETRIES = 30
+MAP_NAME = "auth_map"
+XDP_SECTION = "xdp"
+MAP_MISS_LIMIT = 5
 
 running = True
 
@@ -27,13 +30,17 @@ def stop_handler(_signum, _frame):
 def parse_args():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(
-        description="802.1X/RADIUS enforcement controller: polls auth_map and applies ebtables rules and bridge VLANs")
+        description="802.1X/RADIUS enforcement controller (no-BCC): clang + iproute2 XDP attach + bpftool map polling")
     parser.add_argument("--iface", default="eth0",
                         help="XDP attachment interface and uplink toward CE2 (default: eth0)")
     parser.add_argument("--bridge", default="bridge0",
                         help="vlan-filtering bridge device (default: bridge0)")
     parser.add_argument("--source", default=os.path.join(script_dir, "radius_xdp.c"),
                         help="path to the eBPF C source (default: radius_xdp.c next to this script)")
+    parser.add_argument("--object", default=os.path.join(script_dir, "radius_xdp.o"),
+                        help="path to the compiled eBPF object (default: radius_xdp.o next to this script)")
+    parser.add_argument("--clang", default="clang",
+                        help="clang binary used to compile the XDP object (default: clang)")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="auth_map poll interval in seconds (default: 1.0)")
     return parser.parse_args()
@@ -45,7 +52,7 @@ def check_root():
 
 
 def check_binaries():
-    for binary in ("ebtables", "bridge"):
+    for binary in ("ip", "bpftool", "ebtables", "bridge"):
         if shutil.which(binary) is None:
             sys.exit(f"[!] required binary not found: {binary}")
 
@@ -63,17 +70,117 @@ def run_cmd(cmd, quiet=False):
     return proc.returncode
 
 
-def key_to_mac(key):
-    raw = bytes(key.addr) if hasattr(key, "addr") else bytes(key)[:6]
-    return ":".join(f"{byte:02x}" for byte in raw)
+def ensure_object(args):
+    obj = args.object
+    src = args.source
+    if not os.path.isfile(obj):
+        if not os.path.isfile(src):
+            sys.exit(f"[!] BPF source not found: {src} (and no prebuilt object at {obj})")
+    elif not os.path.isfile(src) or os.path.getmtime(src) <= os.path.getmtime(obj):
+        return obj
+    clang = shutil.which(args.clang)
+    if clang is None:
+        if os.path.isfile(obj):
+            log(f"[!] clang not found; using existing (possibly stale) {obj}")
+            return obj
+        sys.exit(f"[!] clang ({args.clang}) not found and no prebuilt object at {obj}")
+    log(f"[*] compiling {src} -> {obj}")
+    if run_cmd([clang, "-O2", "-target", "bpf", "-c", src, "-o", obj]) != 0:
+        sys.exit(f"[!] eBPF compilation failed ({args.clang} -O2 -target bpf -c)")
+    return obj
 
 
-def scalar_int(value):
+def attach_xdp(iface, obj):
+    for mode, quiet in (("xdp", True), ("xdpgeneric", False)):
+        if run_cmd(["ip", "link", "set", "dev", iface, mode, "obj", obj, "sec", XDP_SECTION],
+                   quiet=quiet) == 0:
+            return mode
+    sys.exit(f"[!] XDP attach to {iface} failed (native and generic); "
+             f"if another XDP program is attached run: ip link set dev {iface} xdp off")
+
+
+def detach_xdp(iface, mode):
+    if run_cmd(["ip", "link", "set", "dev", iface, mode, "off"]) != 0:
+        log(f"[!] XDP detach failed on {iface}")
+    else:
+        log(f"XDP detached from {iface}")
+
+
+def _num(value):
     if isinstance(value, int):
         return value
-    if hasattr(value, "value"):
-        return int(value.value)
-    return int.from_bytes(bytes(value), "little")
+    text = str(value)
+    return int(text, 16) if text.lower().startswith("0x") else int(text)
+
+
+def list_auth_map_ids():
+    try:
+        proc = subprocess.run(["bpftool", "-j", "map", "show"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        maps = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(maps, list):
+        return []
+    return [m["id"] for m in maps
+            if isinstance(m, dict) and str(m.get("name", "")).startswith(MAP_NAME)]
+
+
+def mac_from_key(key):
+    if isinstance(key, dict):
+        raw = key.get("addr")
+        if raw is None:
+            raw = key.get("mac", key.get("mac_addr", key.get("key")))
+        if raw is None:
+            raw = [v for field in key.values() if isinstance(field, list) for v in field]
+    else:
+        raw = key
+    if not isinstance(raw, (list, tuple)) or len(raw) < 6:
+        raise ValueError(f"bad map key: {key!r}")
+    return ":".join(f"{_num(b) & 0xFF:02x}" for b in raw[:6])
+
+
+def value_fields(value, key):
+    if isinstance(value, dict):
+        return _num(value.get("vlan_id", 0)), _num(value.get("status", 0))
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"bad map value for {key}: {value!r}")
+    raw = bytes(_num(b) & 0xFF for b in value)
+    if len(raw) < 11:
+        raise ValueError(f"map value too short for {key}: {len(raw)} bytes")
+    return int.from_bytes(raw[0:4], "little"), raw[10]
+
+
+def dump_map(map_id):
+    try:
+        proc = subprocess.run(["bpftool", "-j", "map", "dump", "id", str(map_id)],
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        entries = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    out = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            mac = mac_from_key(entry.get("key"))
+            vlan, status = value_fields(entry.get("value"), mac)
+        except Exception as exc:
+            log(f"[!] skipping malformed auth entry: {exc}")
+            continue
+        out.append((mac, vlan, status))
+    return out
 
 
 def fdb_port_for_mac(mac, bridge, uplink):
@@ -132,19 +239,24 @@ def wait_interval(interval):
         time.sleep(min(0.2, remaining))
 
 
-def poll_loop(auth_map, iface, bridge, interval):
+def poll_loop(map_id, iface, bridge, interval):
     known = {}
     pending = {}
+    misses = 0
     while running:
-        try:
-            for key, leaf in auth_map.items():
-                try:
-                    mac = key_to_mac(key)
-                    vlan = scalar_int(leaf.vlan_id)
-                    status = scalar_int(leaf.status)
-                except Exception as exc:
-                    log(f"[!] skipping malformed auth entry: {exc}")
-                    continue
+        entries = dump_map(map_id)
+        if entries is None:
+            misses += 1
+            if misses >= MAP_MISS_LIMIT:
+                log(f"[!] auth_map id {map_id} unreadable, re-resolving")
+                ids = list_auth_map_ids()
+                if ids and map_id not in ids:
+                    map_id = ids[0]
+                    log(f"[*] switched to auth_map id {map_id}")
+                    misses = 0
+        else:
+            misses = 0
+            for mac, vlan, status in entries:
                 if status != STATUS_ALLOWED or not 1 <= vlan <= VLAN_MAX:
                     continue
                 if known.get(mac) == vlan:
@@ -152,8 +264,6 @@ def poll_loop(auth_map, iface, bridge, interval):
                 if mac not in pending:
                     log(f"[*] authenticated: mac={mac} vlan={vlan}")
                     pending[mac] = [vlan, 0]
-        except Exception as exc:
-            log(f"[!] auth_map read failed: {exc}")
         for mac in list(pending):
             vlan, attempts = pending[mac]
             if grant_access(mac, vlan, iface, bridge):
@@ -172,40 +282,26 @@ def main():
     args = parse_args()
     check_root()
     check_binaries()
-    if not os.path.isfile(args.source):
-        sys.exit(f"[!] BPF source not found: {args.source}")
+    obj = ensure_object(args)
 
-    try:
-        from bcc import BPF
-    except ImportError:
-        sys.exit("[!] python3 bcc bindings not available (install python3-bcc)")
+    before = set(list_auth_map_ids())
+    mode = attach_xdp(args.iface, obj)
 
-    try:
-        bpf = BPF(src_file=args.source)
-        fn = bpf.load_func("parse_radius", BPF.XDP)
-    except Exception as exc:
-        sys.exit(f"[!] BPF compilation/load failed: {exc}")
-
-    try:
-        bpf.attach_xdp(args.iface, fn, 0)
-    except Exception as exc:
-        sys.exit(f"[!] XDP attach to {args.iface} failed: {exc} "
-                 f"(if another XDP program is attached: ip link set dev {args.iface} xdp off)")
-
-    auth_map = bpf.get_table("auth_map")
-    log(f"attached XDP to {args.iface}; polling auth_map every {args.interval}s (CTRL+C to detach)")
+    ids = [i for i in list_auth_map_ids() if i not in before] or list_auth_map_ids()
+    if not ids:
+        detach_xdp(args.iface, mode)
+        sys.exit(f"[!] auth_map not found after attaching XDP to {args.iface}")
+    map_id = ids[0]
+    log(f"attached XDP to {args.iface} ({mode}); auth_map id {map_id}; "
+        f"polling every {args.interval}s (CTRL+C to detach)")
 
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
 
     try:
-        poll_loop(auth_map, args.iface, args.bridge, args.interval)
+        poll_loop(map_id, args.iface, args.bridge, args.interval)
     finally:
-        try:
-            bpf.remove_xdp(args.iface, 0)
-            log(f"XDP detached from {args.iface}")
-        except Exception as exc:
-            log(f"[!] XDP detach failed: {exc}")
+        detach_xdp(args.iface, mode)
 
 
 if __name__ == "__main__":

@@ -2,15 +2,35 @@
  * radius_xdp.c — programma XDP per l'enforcement 802.1X/RADIUS (Progetto #3).
  * Intercetta gli Access-Accept RADIUS, estrae MAC (attr 31, fallback attr 1)
  * e VLAN (attr 81) e li registra nella mappa auth_map per il controller.
+ *
+ * Varianti senza BCC: il sorgente usa solo kernel headers e viene compilato
+ * con clang e caricato con iproute2 (formato legacy, niente libbpf/BTF):
+ *   clang -O2 -target bpf -c radius_xdp.c -o radius_xdp.o
+ *   ip link set dev eth0 xdp obj radius_xdp.o sec xdp
  */
 
 #include <stddef.h>
 
-#include <uapi/linux/bpf.h>
-#include <uapi/linux/if_ether.h>
-#include <uapi/linux/ip.h>
-#include <uapi/linux/udp.h>
-#include <uapi/linux/in.h>
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/in.h>
+
+#define SEC(NAME) __attribute__((section(NAME), used))
+
+/* helper eBPF dichiarati come puntatori (meccanismo di rilocazione di iproute2) */
+static long (*bpf_map_update_elem)(const void *map, const void *key, const void *value,
+                                   __u64 flags) = (void *)BPF_FUNC_map_update_elem;
+
+/* i campi di rete vanno confrontati in host byte order */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define bpf_htons(x) ((__be16)__builtin_bswap16((__u16)(x)))
+#define bpf_ntohs(x) ((__u16)__builtin_bswap16((__be16)(x)))
+#else
+#define bpf_htons(x) ((__be16)(__u16)(x))
+#define bpf_ntohs(x) ((__u16)(__be16)(x))
+#endif
 
 #define RADIUS_AUTH_PORT                 1812  /* autenticazione */
 #define RADIUS_ACCT_PORT                 1813  /* accounting */
@@ -45,11 +65,29 @@ struct radius_hdr {
     __u8 authenticator[16];
 } __attribute__((packed));
 
-/* mappa MAC -> {vlan, mac, status}; il nome "auth_map" è usato dal controller (BCC) e da bpftool */
-BPF_HASH(auth_map, struct mac_key, struct auth_info, 1024);
+/* definizione mappa nel formato legacy di iproute2 (sezione "maps"):
+ * il nome della mappa per bpftool deriva dal nome del simbolo ("auth_map") */
+struct bpf_map_def {
+    unsigned int type;
+    unsigned int key_size;
+    unsigned int value_size;
+    unsigned int max_entries;
+    unsigned int map_flags;
+};
+
+struct bpf_map_def SEC("maps") auth_map = {
+    .type = BPF_MAP_TYPE_HASH,
+    .key_size = sizeof(struct mac_key),
+    .value_size = sizeof(struct auth_info),
+    .max_entries = 1024,
+    .map_flags = 0,
+};
+
+/* licenza obbligatoria per il loader di iproute2 */
+char _license[] SEC("license") = "GPL";
 
 /* carattere esadecimale -> valore, -1 se non valido */
-static __always_inline int hex_val(__u8 c)
+static inline __attribute__((always_inline)) int hex_val(__u8 c)
 {
     if (c >= '0' && c <= '9')
         return c - '0';
@@ -64,12 +102,12 @@ static __always_inline int hex_val(__u8 c)
  * Converte la stringa MAC in 6 byte; separatori ':' o '-' e maiuscole opzionali.
  * Loop srotolato con verifica p_end a ogni carattere (vincolo del verifier).
  */
-static __always_inline int parse_mac(const __u8 *p, const void *p_end, struct mac_key *out)
+static inline __attribute__((always_inline)) int parse_mac(const __u8 *p, const void *p_end, struct mac_key *out)
 {
     __u8 byte = 0;
     int digits = 0;
 
-#pragma unroll
+#pragma unroll 32
     for (int i = 0; i < MAC_STR_LEN; i++) {
         if ((const void *)(p + i) >= p_end)
             break;
@@ -95,12 +133,12 @@ static __always_inline int parse_mac(const __u8 *p, const void *p_end, struct ma
 }
 
 /* stringa VLAN (max 4 cifre) -> numero, con validazione del range */
-static __always_inline int parse_vlan_id(const __u8 *p, const void *p_end, __u32 *out)
+static inline __attribute__((always_inline)) int parse_vlan_id(const __u8 *p, const void *p_end, __u32 *out)
 {
     __u32 val = 0;
     int digits = 0;
 
-#pragma unroll
+#pragma unroll 32
     for (int i = 0; i < VLAN_STR_MAX; i++) {
         if ((const void *)(p + i) >= p_end)
             break;
@@ -159,8 +197,6 @@ int parse_radius(struct xdp_md *ctx)
     if (radius->code != RADIUS_CODE_ACCESS_ACCEPT)
         return XDP_PASS;
 
-    bpf_printk("radius_xdp: Access-Accept detected\n");
-
     /* lunghezza dichiarata dal pacchetto */
     __u16 rad_len = bpf_ntohs(radius->length);
     if (rad_len < RADIUS_HDR_LEN)
@@ -182,7 +218,7 @@ int parse_radius(struct xdp_md *ctx)
     __u8 *attr = (void *)(radius + 1);
 
     /* cammino sui TLV: 2 byte (type, length) + valore */
-#pragma unroll
+#pragma unroll 32
     for (int i = 0; i < RADIUS_MAX_ATTRS; i++) {
         if ((void *)(attr + 2) > rad_end)
             break;
@@ -251,8 +287,7 @@ int parse_radius(struct xdp_md *ctx)
     info.status = 1;
 
     /* insert-or-update: una re-auth aggiorna la voce esistente */
-    if (auth_map.update(&key, &info) == 0)
-        bpf_printk("radius_xdp: stored MAC -> VLAN %u\n", vlan);
+    bpf_map_update_elem(&auth_map, &key, &info, BPF_ANY);
 
     /* il traffico passa sempre: l'XDP è solo osservatore */
     return XDP_PASS;
