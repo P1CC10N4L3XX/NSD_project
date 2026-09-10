@@ -176,6 +176,36 @@ static inline __attribute__((always_inline)) int parse_vlan_id(const __u8 *p, co
     return 0;
 }
 
+/* cerca il primo attributo di tipo 'want'; ritorna il puntatore al valore
+ * (NULL se assente) e scrive la lunghezza del valore in *vlen.
+ *
+ * Niente ciclo unico che accumula i tre attributi: con il dispatch a tre
+ * rami il verifier esplora 4 percorsi per iterazione su TUTTE le iterazioni
+ * (i rami "trovato" e "non trovato" proseguono entrambe il ciclo) e gli stati
+ * esplodono esponenzialmente ("BPF program is too large"). Con una ricerca
+ * per tipo e uscita immediata resta un solo percorso vivo per iterazione. */
+static inline __attribute__((always_inline)) const __u8 *
+find_attr(__u8 *attr, void *rad_end, void *data_end, __u8 want, __u8 *vlen)
+{
+    for (int i = 0; i < RADIUS_MAX_ATTRS; i++) {
+        if ((void *)(attr + 2) > rad_end || (void *)(attr + 2) > data_end)
+            return NULL;
+        __u8 type = attr[0];
+        __u8 alen = attr[1];
+        /* TLV malformato: mi fermo */
+        if (alen < 2)
+            return NULL;
+        if ((void *)(attr + alen) > rad_end || (void *)(attr + alen) > data_end)
+            return NULL;
+        if (type == want) {
+            *vlen = alen - 2;
+            return attr + 2;
+        }
+        attr += alen;
+    }
+    return NULL;
+}
+
 SEC("xdp")
 int parse_radius(struct xdp_md *ctx)
 {
@@ -235,47 +265,22 @@ int parse_radius(struct xdp_md *ctx)
     if (rad_end > data_end)
         rad_end = data_end;
 
-    const __u8 *csi_val = NULL;
-    __u8 csi_len = 0;
-    const __u8 *user_val = NULL;
-    __u8 user_len = 0;
-    const __u8 *vlan_val = NULL;
-    __u8 vlan_len = 0;
-
     /* gli attributi partono subito dopo i 20 byte di header */
     __u8 *attr = (void *)(radius + 1);
 
-    /* cammino sui TLV: 2 byte (type, length) + valore.
-     * Ogni accesso è verificato SIA contro rad_end (semantica: padding/troncamento)
-     * SIA contro data_end: il verifier estende il range leggibile del puntatore
-     * solo sui confronti con data_end, essendo rad_end a sua volta derivato da
-     * un puntatore a offset variabile (radius + rad_len) */
-#pragma unroll 32
-    for (int i = 0; i < RADIUS_MAX_ATTRS; i++) {
-        if ((void *)(attr + 2) > rad_end || (void *)(attr + 2) > data_end)
-            break;
-        __u8 type = attr[0];
-        __u8 alen = attr[1];
-        /* TLV malformato: mi fermo */
-        if (alen < 2)
-            break;
-        if ((void *)(attr + alen) > rad_end || (void *)(attr + alen) > data_end)
-            break;
-        __u8 *val = attr + 2;
-        __u8 vlen = alen - 2;
-        /* tengo solo i tre attributi di interesse (il primo incontrato vince) */
-        if (type == RADIUS_ATTR_CALLING_STATION_ID && !csi_val) {
-            csi_val = val;
-            csi_len = vlen;
-        } else if (type == RADIUS_ATTR_USER_NAME && !user_val) {
-            user_val = val;
-            user_len = vlen;
-        } else if (type == RADIUS_ATTR_TUNNEL_PRIVATE_GROUP && !vlan_val) {
-            vlan_val = val;
-            vlan_len = vlen;
-        }
-        attr += alen;
-    }
+    /* ricerche separate con uscita immediata: un passaggio per attributo.
+     * Il fallback sull'attr 1 parte solo se manca l'attr 31. */
+    __u8 csi_len = 0;
+    __u8 user_len = 0;
+    __u8 vlan_len = 0;
+    const __u8 *csi_val = find_attr(attr, rad_end, data_end,
+                                    RADIUS_ATTR_CALLING_STATION_ID, &csi_len);
+    const __u8 *vlan_val = find_attr(attr, rad_end, data_end,
+                                     RADIUS_ATTR_TUNNEL_PRIVATE_GROUP, &vlan_len);
+    const __u8 *user_val = NULL;
+    if (!csi_val)
+        user_val = find_attr(attr, rad_end, data_end,
+                             RADIUS_ATTR_USER_NAME, &user_len);
 
     /* senza VLAN non c'è niente da registrare */
     if (!vlan_val || !vlan_len)
