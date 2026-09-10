@@ -97,38 +97,56 @@ static inline __attribute__((always_inline)) int hex_val(__u8 c)
     return -1;
 }
 
-/*
- * Converte la stringa MAC in 6 byte; separatori ':' o '-' e maiuscole opzionali.
- * Loop srotolato con verifica p_end a ogni carattere (vincolo del verifier).
- */
-static inline __attribute__((always_inline)) int parse_mac(const __u8 *p, const void *p_end, struct mac_key *out)
+/* due nibble consecutivi a offset costante -> byte, -1 se non esadecimale */
+static inline __attribute__((always_inline)) int hex_byte(const __u8 *p, int off)
 {
-    __u8 byte = 0;
-    int digits = 0;
+    int hi = hex_val(p[off]);
+    int lo = hex_val(p[off + 1]);
+    if (hi < 0 || lo < 0)
+        return -1;
+    return (__u8)((hi << 4) | lo);
+}
 
-#pragma unroll 32
-    for (int i = 0; i < MAC_STR_LEN; i++) {
-        if ((const void *)(p + i) >= p_end)
-            break;
-        __u8 c = p[i];
-        int v = hex_val(c);
-        if (v >= 0) {
-            byte = (__u8)((byte << 4) | (__u8)v);
-            digits++;
-            if ((digits & 1) == 0) {
-                int idx = digits >> 1;
-                if (idx > MAC_ALEN)
-                    return -1;
-                out->addr[idx - 1] = byte;
-                byte = 0;
-                if (idx == MAC_ALEN)
-                    return 0;
-            }
-        } else if (c != ':' && c != '-') {
-            break;
-        }
+static inline __attribute__((always_inline)) int is_mac_sep(__u8 c)
+{
+    return c == ':' || c == '-';
+}
+
+/*
+ * MAC in formato compatto "aabbccddeeff" (12 caratteri) o con separatori
+ * "aa:bb:cc:dd:ee:ff" / "aa-bb-cc-dd-ee-ff" (17 caratteri, separatori solo
+ * fra le coppie). Tutto a offset costanti: niente puntatore+scalare e niente
+ * indici runtime sullo stack (vincoli del verifier). Il chiamante ha già
+ * verificato la leggibilità di MAC_STR_LEN byte.
+ */
+static inline __attribute__((always_inline)) int parse_mac(const __u8 *p, struct mac_key *out)
+{
+    int ok = 1;
+
+#pragma unroll
+    for (int k = 0; k < MAC_ALEN; k++) {
+        int b = hex_byte(p, 2 * k);
+        if (b < 0)
+            ok = 0;
+        else
+            out->addr[k] = (__u8)b;
     }
-    return digits == 2 * MAC_ALEN ? 0 : -1;
+    if (ok)
+        return 0;
+
+    ok = 1;
+#pragma unroll
+    for (int k = 0; k < MAC_ALEN; k++) {
+        int b = hex_byte(p, 3 * k);
+        if (b < 0) {
+            ok = 0;
+            continue;
+        }
+        out->addr[k] = (__u8)b;
+        if (k < MAC_ALEN - 1 && !is_mac_sep(p[3 * k + 2]))
+            ok = 0;
+    }
+    return ok ? 0 : -1;
 }
 
 /* stringa VLAN (max 4 cifre) -> numero, con validazione del range */
@@ -258,23 +276,23 @@ int parse_radius(struct xdp_md *ctx)
     if (!vlan_val || !vlan_len)
         return XDP_PASS;
 
-    if ((void *)(vlan_val + vlan_len) > data_end)
+    /* leggibilità con offset COSTANTE: sommare uno scalare runtime al puntatore
+     * pkt ne cambia il reg id e il verifier non promuoverebbe il range leggibile
+     * del puntatore originale (serve a parse_vlan_id per i load a p+i, i<4) */
+    if ((void *)(vlan_val + VLAN_STR_MAX) > data_end)
         return XDP_PASS;
 
     /* MAC: preferenza all'attr 31, fallback sull'attr 1 se contiene un MAC */
     const __u8 *mac_src = NULL;
-    __u8 mac_src_len = 0;
 
     if (csi_val && csi_len >= 2 * MAC_ALEN) {
-        if ((void *)(csi_val + csi_len) > data_end)
+        if ((void *)(csi_val + MAC_STR_LEN) > data_end)
             return XDP_PASS;
         mac_src = csi_val;
-        mac_src_len = csi_len;
     } else if (user_val && user_len >= 2 * MAC_ALEN) {
-        if ((void *)(user_val + user_len) > data_end)
+        if ((void *)(user_val + MAC_STR_LEN) > data_end)
             return XDP_PASS;
         mac_src = user_val;
-        mac_src_len = user_len;
     }
 
     /* senza un MAC riconoscibile non posso comporre la chiave della mappa */
@@ -283,7 +301,7 @@ int parse_radius(struct xdp_md *ctx)
 
     struct mac_key key = {};
     /* testo del MAC -> 6 byte */
-    if (parse_mac(mac_src, (const void *)mac_src + mac_src_len, &key) < 0)
+    if (parse_mac(mac_src, &key) < 0)
         return XDP_PASS;
 
     __u32 vlan = 0;
