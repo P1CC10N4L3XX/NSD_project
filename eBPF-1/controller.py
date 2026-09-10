@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -70,6 +71,36 @@ def run_cmd(cmd, quiet=False):
     return proc.returncode
 
 
+MULTIARCH_MAP = {
+    "x86_64": "x86_64-linux-gnu",
+    "i386": "i386-linux-gnu",
+    "i686": "i386-linux-gnu",
+    "aarch64": "aarch64-linux-gnu",
+    "armv6l": "arm-linux-gnueabihf",
+    "armv7l": "arm-linux-gnueabihf",
+    "riscv64": "riscv64-linux-gnu",
+    "ppc64le": "powerpc64le-linux-gnu",
+    "s390x": "s390x-linux-gnu",
+}
+
+
+def kernel_include_flags():
+    if os.path.isfile("/usr/include/asm/types.h"):
+        return []
+    triple = MULTIARCH_MAP.get(platform.machine())
+    candidates = [f"/usr/include/{triple}"] if triple else []
+    try:
+        proc = subprocess.run(["gcc", "-print-multiarch"], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            candidates.append("/usr/include/" + proc.stdout.strip())
+    except FileNotFoundError:
+        pass
+    for cand in candidates:
+        if cand and os.path.isfile(os.path.join(cand, "asm", "types.h")):
+            return ["-I", cand]
+    return []
+
+
 def ensure_object(args):
     obj = args.object
     src = args.source
@@ -85,8 +116,17 @@ def ensure_object(args):
             return obj
         sys.exit(f"[!] clang ({args.clang}) not found and no prebuilt object at {obj}")
     log(f"[*] compiling {src} -> {obj}")
-    if run_cmd([clang, "-O2", "-target", "bpf", "-c", src, "-o", obj]) != 0:
-        sys.exit(f"[!] eBPF compilation failed ({args.clang} -O2 -target bpf -c)")
+    cmd_base = [clang, "-O2", "-target", "bpf", "-c", src, "-o", obj]
+    rc = run_cmd(cmd_base)
+    if rc != 0:
+        extra = kernel_include_flags()
+        if extra:
+            log(f"[*] retry with include dir {extra[1]}")
+            rc = run_cmd(cmd_base + extra)
+    if rc != 0:
+        sys.exit("[!] eBPF compilation failed: verificare che i kernel headers UAPI siano "
+                 "presenti (asm/types.h: serve il pacchetto linux-libc-dev o -I/usr/include/"
+                 "<multiarch>) oppure compilare radius_xdp.o sull'host (vedi guida §2.2)")
     return obj
 
 

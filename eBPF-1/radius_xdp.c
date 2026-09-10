@@ -2,11 +2,6 @@
  * radius_xdp.c — programma XDP per l'enforcement 802.1X/RADIUS (Progetto #3).
  * Intercetta gli Access-Accept RADIUS, estrae MAC (attr 31, fallback attr 1)
  * e VLAN (attr 81) e li registra nella mappa auth_map per il controller.
- *
- * Varianti senza BCC: il sorgente usa solo kernel headers e viene compilato
- * con clang e caricato con iproute2 (formato legacy, niente libbpf/BTF):
- *   clang -O2 -target bpf -c radius_xdp.c -o radius_xdp.o
- *   ip link set dev eth0 xdp obj radius_xdp.o sec xdp
  */
 
 #include <stddef.h>
@@ -83,7 +78,7 @@ struct bpf_map_def SEC("maps") auth_map = {
     .map_flags = 0,
 };
 
-/* licenza obbligatoria per il loader di iproute2 */
+
 char _license[] SEC("license") = "GPL";
 
 /* carattere esadecimale -> valore, -1 se non valido */
