@@ -133,6 +133,7 @@ def ensure_object(args):
         sys.exit("[!] eBPF compilation failed: verificare che i kernel headers UAPI siano "
                  "presenti (asm/types.h: serve il pacchetto linux-libc-dev o -I/usr/include/"
                  "<multiarch>) oppure copiare nel nodo radius_xdp.o precompilato (vedi guida §2.2)")
+    log(f"[*] compiled OK -> {obj}")
     return obj
 
 

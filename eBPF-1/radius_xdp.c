@@ -112,41 +112,46 @@ static inline __attribute__((always_inline)) int is_mac_sep(__u8 c)
     return c == ':' || c == '-';
 }
 
-/*
- * MAC in formato compatto "aabbccddeeff" (12 caratteri) o con separatori
- * "aa:bb:cc:dd:ee:ff" / "aa-bb-cc-dd-ee-ff" (17 caratteri, separatori solo
- * fra le coppie). Tutto a offset costanti: niente puntatore+scalare e niente
- * indici runtime sullo stack (vincoli del verifier). Il chiamante ha già
- * verificato la leggibilità di MAC_STR_LEN byte.
- */
-static inline __attribute__((always_inline)) int parse_mac(const __u8 *p, struct mac_key *out)
+/* formato compatto "aabbccddeeff": 12 caratteri esadecimali consecutivi */
+static inline __attribute__((always_inline)) int parse_mac_compact(const __u8 *p, struct mac_key *out)
 {
-    int ok = 1;
-
 #pragma unroll
     for (int k = 0; k < MAC_ALEN; k++) {
         int b = hex_byte(p, 2 * k);
         if (b < 0)
-            ok = 0;
-        else
-            out->addr[k] = (__u8)b;
+            return -1;
+        out->addr[k] = (__u8)b;
     }
-    if (ok)
-        return 0;
+    return 0;
+}
 
-    ok = 1;
+/* formato con separatori "aa:bb:cc:dd:ee:ff" / "aa-bb-cc-dd-ee-ff" */
+static inline __attribute__((always_inline)) int parse_mac_sep(const __u8 *p, struct mac_key *out)
+{
 #pragma unroll
     for (int k = 0; k < MAC_ALEN; k++) {
         int b = hex_byte(p, 3 * k);
-        if (b < 0) {
-            ok = 0;
-            continue;
-        }
+        if (b < 0)
+            return -1;
         out->addr[k] = (__u8)b;
         if (k < MAC_ALEN - 1 && !is_mac_sep(p[3 * k + 2]))
-            ok = 0;
+            return -1;
     }
-    return ok ? 0 : -1;
+    return 0;
+}
+
+/*
+ * MAC in formato compatto (12 caratteri) o con separatori (17). Offset
+ * costanti e uscita IMMEDIATA al primo carattere non valido: un flag "ok"
+ * vivo attraverso il loop e' un vettore di esplosione degli stati del
+ * verifier (ogni combinazione valida/fallita diventa uno stato distinto).
+ * Il chiamante ha gia' verificato la leggibilita' di MAC_STR_LEN byte.
+ */
+static inline __attribute__((always_inline)) int parse_mac(const __u8 *p, struct mac_key *out)
+{
+    if (parse_mac_compact(p, out) == 0)
+        return 0;
+    return parse_mac_sep(p, out);
 }
 
 /* stringa VLAN (max 4 cifre) -> numero, con validazione del range */
