@@ -2,17 +2,17 @@
 
 set -eu
 
-ip link set lo up
-ip link set eth0 up
-ip link set eth1 up
-ip link set eth2 up
-
 ip link add bridge0 type bridge vlan_filtering 1
 
 ip link set eth0 master bridge0
 ip link set eth1 master bridge0
 ip link set eth2 master bridge0
 
+ip link set lo up
+ip link set eth0 up
+ip link set eth1 up
+ip link set eth2 up
+ip link set bridge0 up
 
 echo 8 > /sys/class/net/bridge0/bridge/group_fwd_mask
 
