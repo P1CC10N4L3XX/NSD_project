@@ -1,0 +1,259 @@
+/*
+ * radius_xdp.c — programma XDP per l'enforcement 802.1X/RADIUS (Progetto #3).
+ * Intercetta gli Access-Accept RADIUS, estrae MAC (attr 31, fallback attr 1)
+ * e VLAN (attr 81) e li registra nella mappa auth_map per il controller.
+ */
+
+#include <stddef.h>
+
+#include <uapi/linux/bpf.h>
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/in.h>
+
+#define RADIUS_AUTH_PORT                 1812  /* autenticazione */
+#define RADIUS_ACCT_PORT                 1813  /* accounting */
+#define RADIUS_CODE_ACCESS_ACCEPT        2     /* risposta "accesso consentito" */
+#define RADIUS_HDR_LEN                   20    /* header RADIUS (RFC 2865) */
+#define RADIUS_ATTR_USER_NAME            1     /* fallback per il MAC */
+#define RADIUS_ATTR_CALLING_STATION_ID   31    /* MAC del supplicant */
+#define RADIUS_ATTR_TUNNEL_PRIVATE_GROUP 81    /* VLAN assegnata (stringa) */
+#define RADIUS_MAX_ATTRS                 32    /* loop limitato: lo esige il verifier */
+#define MAC_ALEN                         6
+#define MAC_STR_LEN                      17    /* "aa:bb:cc:dd:ee:ff" */
+#define VLAN_STR_MAX                     4     /* fino a 4 cifre */
+#define VLAN_ID_MAX                      4094  /* range VLAN valido */
+
+/* chiave della mappa: MAC del client */
+struct mac_key {
+    __u8 addr[MAC_ALEN];
+};
+
+/* valore della mappa: VLAN assegnata e stato (1 = autenticato) */
+struct auth_info {
+    __u32 vlan_id;
+    __u8 mac_addr[MAC_ALEN];
+    __u8 status;
+};
+
+/* header RADIUS, 20 byte (RFC 2865) */
+struct radius_hdr {
+    __u8 code;
+    __u8 identifier;
+    __be16 length;
+    __u8 authenticator[16];
+} __attribute__((packed));
+
+/* mappa MAC -> {vlan, mac, status}; il nome "auth_map" è usato dal controller (BCC) e da bpftool */
+BPF_HASH(auth_map, struct mac_key, struct auth_info, 1024);
+
+/* carattere esadecimale -> valore, -1 se non valido */
+static __always_inline int hex_val(__u8 c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/*
+ * Converte la stringa MAC in 6 byte; separatori ':' o '-' e maiuscole opzionali.
+ * Loop srotolato con verifica p_end a ogni carattere (vincolo del verifier).
+ */
+static __always_inline int parse_mac(const __u8 *p, const void *p_end, struct mac_key *out)
+{
+    __u8 byte = 0;
+    int digits = 0;
+
+#pragma unroll
+    for (int i = 0; i < MAC_STR_LEN; i++) {
+        if ((const void *)(p + i) >= p_end)
+            break;
+        __u8 c = p[i];
+        int v = hex_val(c);
+        if (v >= 0) {
+            byte = (__u8)((byte << 4) | (__u8)v);
+            digits++;
+            if ((digits & 1) == 0) {
+                int idx = digits >> 1;
+                if (idx > MAC_ALEN)
+                    return -1;
+                out->addr[idx - 1] = byte;
+                byte = 0;
+                if (idx == MAC_ALEN)
+                    return 0;
+            }
+        } else if (c != ':' && c != '-') {
+            break;
+        }
+    }
+    return digits == 2 * MAC_ALEN ? 0 : -1;
+}
+
+/* stringa VLAN (max 4 cifre) -> numero, con validazione del range */
+static __always_inline int parse_vlan_id(const __u8 *p, const void *p_end, __u32 *out)
+{
+    __u32 val = 0;
+    int digits = 0;
+
+#pragma unroll
+    for (int i = 0; i < VLAN_STR_MAX; i++) {
+        if ((const void *)(p + i) >= p_end)
+            break;
+        __u8 c = p[i];
+        if (c < '0' || c > '9')
+            break;
+        val = val * 10 + (__u32)(c - '0');
+        digits++;
+    }
+    if (digits == 0 || val > VLAN_ID_MAX)
+        return -1;
+    *out = val;
+    return 0;
+}
+
+SEC("xdp")
+int parse_radius(struct xdp_md *ctx)
+{
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    /* ogni header va verificato contro data_end prima di accedervi (verifier) */
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+    /* solo frame IPv4 */
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+    /* solo UDP */
+    if (ip->protocol != IPPROTO_UDP)
+        return XDP_PASS;
+    /* IHL minimo: header IP di 20 byte */
+    if (ip->ihl < 5)
+        return XDP_PASS;
+
+    /* L4 si trova a ip + IHL*4: gestisce anche header IP con opzioni */
+    struct udphdr *udp = (struct udphdr *)((char *)ip + (__u32)ip->ihl * 4);
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+
+    /* RADIUS se la porta sorgente o destinazione è 1812/1813 */
+    __u16 sport = bpf_ntohs(udp->source);
+    __u16 dport = bpf_ntohs(udp->dest);
+    if (sport != RADIUS_AUTH_PORT && dport != RADIUS_AUTH_PORT &&
+        sport != RADIUS_ACCT_PORT && dport != RADIUS_ACCT_PORT)
+        return XDP_PASS;
+
+    struct radius_hdr *radius = (void *)(udp + 1);
+    if ((void *)(radius + 1) > data_end)
+        return XDP_PASS;
+    /* analizza solo gli Access-Accept */
+    if (radius->code != RADIUS_CODE_ACCESS_ACCEPT)
+        return XDP_PASS;
+
+    bpf_printk("radius_xdp: Access-Accept detected\n");
+
+    /* lunghezza dichiarata dal pacchetto */
+    __u16 rad_len = bpf_ntohs(radius->length);
+    if (rad_len < RADIUS_HDR_LEN)
+        return XDP_PASS;
+
+    /* limite degli attributi, clamped al pacchetto reale (padding/troncamento) */
+    void *rad_end = (char *)radius + rad_len;
+    if (rad_end > data_end)
+        rad_end = data_end;
+
+    const __u8 *csi_val = NULL;
+    __u8 csi_len = 0;
+    const __u8 *user_val = NULL;
+    __u8 user_len = 0;
+    const __u8 *vlan_val = NULL;
+    __u8 vlan_len = 0;
+
+    /* gli attributi partono subito dopo i 20 byte di header */
+    __u8 *attr = (void *)(radius + 1);
+
+    /* cammino sui TLV: 2 byte (type, length) + valore */
+#pragma unroll
+    for (int i = 0; i < RADIUS_MAX_ATTRS; i++) {
+        if ((void *)(attr + 2) > rad_end)
+            break;
+        __u8 type = attr[0];
+        __u8 alen = attr[1];
+        /* TLV malformato: mi fermo */
+        if (alen < 2)
+            break;
+        if ((void *)(attr + alen) > rad_end)
+            break;
+        __u8 *val = attr + 2;
+        __u8 vlen = alen - 2;
+        /* tengo solo i tre attributi di interesse (il primo incontrato vince) */
+        if (type == RADIUS_ATTR_CALLING_STATION_ID && !csi_val) {
+            csi_val = val;
+            csi_len = vlen;
+        } else if (type == RADIUS_ATTR_USER_NAME && !user_val) {
+            user_val = val;
+            user_len = vlen;
+        } else if (type == RADIUS_ATTR_TUNNEL_PRIVATE_GROUP && !vlan_val) {
+            vlan_val = val;
+            vlan_len = vlen;
+        }
+        attr += alen;
+    }
+
+    /* senza VLAN non c'è niente da registrare */
+    if (!vlan_val || !vlan_len)
+        return XDP_PASS;
+
+    if ((void *)(vlan_val + vlan_len) > data_end)
+        return XDP_PASS;
+
+    /* MAC: preferenza all'attr 31, fallback sull'attr 1 se contiene un MAC */
+    const __u8 *mac_src = NULL;
+    __u8 mac_src_len = 0;
+
+    if (csi_val && csi_len >= 2 * MAC_ALEN) {
+        if ((void *)(csi_val + csi_len) > data_end)
+            return XDP_PASS;
+        mac_src = csi_val;
+        mac_src_len = csi_len;
+    } else if (user_val && user_len >= 2 * MAC_ALEN) {
+        if ((void *)(user_val + user_len) > data_end)
+            return XDP_PASS;
+        mac_src = user_val;
+        mac_src_len = user_len;
+    }
+
+    /* senza un MAC riconoscibile non posso comporre la chiave della mappa */
+    if (!mac_src)
+        return XDP_PASS;
+
+    struct mac_key key = {};
+    /* testo del MAC -> 6 byte */
+    if (parse_mac(mac_src, (const void *)mac_src + mac_src_len, &key) < 0)
+        return XDP_PASS;
+
+    __u32 vlan = 0;
+    if (parse_vlan_id(vlan_val, (const void *)vlan_val + vlan_len, &vlan) < 0)
+        return XDP_PASS;
+
+    struct auth_info info = {};
+    info.vlan_id = vlan;
+    __builtin_memcpy(info.mac_addr, key.addr, MAC_ALEN);
+    info.status = 1;
+
+    /* insert-or-update: una re-auth aggiorna la voce esistente */
+    if (auth_map.update(&key, &info) == 0)
+        bpf_printk("radius_xdp: stored MAC -> VLAN %u\n", vlan);
+
+    /* il traffico passa sempre: l'XDP è solo osservatore */
+    return XDP_PASS;
+}
