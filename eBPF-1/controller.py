@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import glob
 import json
 import os
 import platform
@@ -98,6 +99,8 @@ def kernel_include_flags():
     for cand in candidates:
         if cand and os.path.isfile(os.path.join(cand, "asm", "types.h")):
             return ["-I", cand]
+    for found in sorted(glob.glob("/usr/include/*/asm/types.h")):
+        return ["-I", os.path.dirname(os.path.dirname(found))]
     return []
 
 
@@ -124,9 +127,12 @@ def ensure_object(args):
             log(f"[*] retry with include dir {extra[1]}")
             rc = run_cmd(cmd_base + extra)
     if rc != 0:
+        if os.path.isfile(obj):
+            log(f"[!] compilation failed; using existing (possibly stale) {obj}")
+            return obj
         sys.exit("[!] eBPF compilation failed: verificare che i kernel headers UAPI siano "
                  "presenti (asm/types.h: serve il pacchetto linux-libc-dev o -I/usr/include/"
-                 "<multiarch>) oppure compilare radius_xdp.o sull'host (vedi guida §2.2)")
+                 "<multiarch>) oppure copiare nel nodo radius_xdp.o precompilato (vedi guida §2.2)")
     return obj
 
 
