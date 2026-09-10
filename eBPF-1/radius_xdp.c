@@ -52,11 +52,14 @@ struct auth_info {
     __u8 status;
 };
 
-/* header RADIUS, 20 byte (RFC 2865) */
+/* header RADIUS, 20 byte (RFC 2865); la lunghezza è nei due byte separati
+ * perché bpf_ntohs (istruzione di byte-swap) fa perdere al verifier i bound
+ * del registro e blocca l'aritmetica "puntatore pacchetto + scalare" */
 struct radius_hdr {
     __u8 code;
     __u8 identifier;
-    __be16 length;
+    __u8 length_hi;
+    __u8 length_lo;
     __u8 authenticator[16];
 } __attribute__((packed));
 
@@ -192,8 +195,9 @@ int parse_radius(struct xdp_md *ctx)
     if (radius->code != RADIUS_CODE_ACCESS_ACCEPT)
         return XDP_PASS;
 
-    /* lunghezza dichiarata dal pacchetto */
-    __u16 rad_len = bpf_ntohs(radius->length);
+    /* lunghezza dichiarata dal pacchetto: assemblata dai due byte (shift+or su
+     * load a byte, sempre bounded per il verifier), senza istruzioni di swap */
+    __u16 rad_len = (__u16)(((__u16)radius->length_hi << 8) | radius->length_lo);
     if (rad_len < RADIUS_HDR_LEN)
         return XDP_PASS;
 
