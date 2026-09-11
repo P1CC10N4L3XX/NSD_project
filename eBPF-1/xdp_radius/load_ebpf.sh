@@ -66,8 +66,9 @@ ls -la /sys/fs/bpf | egrep 'identity_map|auth_map' || true
 # Start userspace program
 # -------------------------------
 
-# VLAN 10 -> eth1 (client-B1), VLAN 20 -> eth2 (client-B2)
-VLAN_MAP="${VLAN_MAP:-10:eth1,20:eth2}"
+# Whitelist VLAN ammesse (10 = client-B1, 20 = client-B2). La porta client
+# NON e' configurata: viene derivata da ingress_port_idx nella claim EAPOL.
+VLANS="${VLANS:-10,20}"
 BRIDGE="${BRIDGE:-bridge0}"
 GATEWAY_IFACE="${GATEWAY_IFACE:-eth0}"
 MAP_PATH="${MAP_PATH:-/sys/fs/bpf/auth_map}"
@@ -75,7 +76,7 @@ INTERVAL_MS="${INTERVAL_MS:-200}"
 LOG_LEVEL="${LOG_LEVEL:-2}"
 
 echo "[*] Userspace config:"
-echo "    VLAN_MAP=${VLAN_MAP}"
+echo "    VLANS=${VLANS}"
 echo "    BRIDGE=${BRIDGE}"
 echo "    GATEWAY_IFACE=${GATEWAY_IFACE}"
 echo "    MAP_PATH=${MAP_PATH}"
@@ -84,7 +85,7 @@ echo "    LOG_LEVEL=${LOG_LEVEL}"
 
 echo "[*] Starting userspace xdp_user..."
 exec ./xdp_user \
-  --vlan-map "${VLAN_MAP}" \
+  --vlans "${VLANS}" \
   --bridge "${BRIDGE}" \
   --gateway-iface "${GATEWAY_IFACE}" \
   --map-path "${MAP_PATH}" \
