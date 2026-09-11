@@ -1,0 +1,1 @@
+client-A1 operational — AppArmor hardening active (profile client-a1-app, enforce mode)

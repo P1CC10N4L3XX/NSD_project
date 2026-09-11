@@ -1,0 +1,50 @@
+# Profilo AppArmor per il servizio HTTP di client-A1 (Site 1).
+#
+# Programma confinato: python3 /opt/client-a1/app.py — servizio esposto di
+# rete su un dispositivo "sensitive" (traccia NSD 2025-26, VPN Site 1).
+#
+# Obiettivi di sicurezza implementati:
+#   (1) deny lettura credenziali OS           -> /etc/shadow, /etc/shadow-, /etc/gshadow
+#   (3) deny scrittura in /etc                -> integrita' della configurazione
+#   (4) deny esecuzione da world-writable     -> /tmp, /var/tmp, /dev/shm
+#   (5) rete limitata al necessario           -> solo TCP IPv4 (deny-by-default
+#                                                 per UDP/ICMP/raw)
+#
+# I rule "deny" prevalgono sempre su qualunque allow ereditato dalle
+# astrazioni incluse. Profilo nominato: si entra con aa-exec -p client-a1-app.
+
+#include <tunables/global>
+
+profile client-a1-app flags=(attach_disconnected) {
+  #include <abstractions/base>
+
+  # interprete e applicazione
+  /usr/bin/python3* mr,
+  /usr/lib/python3*/** r,
+  /usr/local/lib/python3*/** r,
+  /opt/client-a1/app.py r,
+
+  # i propri dati: unica area con scrittura concessa
+  /opt/client-a1/data/ r,
+  /opt/client-a1/data/** rw,
+
+  # informazioni di runtime usate da python
+  /proc/sys/kernel/random/boot_id r,
+  /sys/devices/system/cpu/online r,
+
+  # --- obiettivo (1): credenziali OS ---
+  deny /etc/shadow r,
+  deny /etc/shadow- r,
+  deny /etc/gshadow r,
+
+  # --- obiettivo (3): integrita' di /etc ---
+  deny /etc/** w,
+
+  # --- obiettivo (4): niente esecuzione da path world-writable ---
+  deny /tmp/** x,
+  deny /var/tmp/** x,
+  deny /dev/shm/** x,
+
+  # --- obiettivo (5): solo il traffico di servizio ---
+  network inet stream,
+}
