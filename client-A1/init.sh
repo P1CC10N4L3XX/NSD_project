@@ -2,6 +2,12 @@
 # client-A1 (Site 1) — avvio del servizio con AppArmor in enforce mode
 set -eu
 
+
+ip link set lo up
+ip link set eth0 up
+
+ip addr add 192.168.3.2/24 dev eth0
+
 # securityfs non e' montata nei container di default: serve per parlare
 # con il LSM del kernel (il nodo GNS3 e' privileged)
 if [ ! -d /sys/kernel/security/apparmor ]; then
