@@ -1,0 +1,14 @@
+# Log di debug locali
+log*.txt
+*.o.tmp
+__pycache__/
+
+# Materiale locale non da versionare
+AGENTS.md
+CONTEXT/
+NSD Projects 2025-26.pdf
+client-A1/README.md
+eBPF-1/CONFIG_AND_TESTING_GUIDE.md
+eBPF-1/PROCEDURA_ESAME.md
+eBPF-1/hostapd/
+eBPF-1/legacy/
