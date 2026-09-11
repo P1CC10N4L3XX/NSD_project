@@ -1,0 +1,1 @@
+wpa_supplicant -B -D wired -i eth0 -c /root/wpa/wpa_supplicant.conf -C /run/wpa_supplicant
